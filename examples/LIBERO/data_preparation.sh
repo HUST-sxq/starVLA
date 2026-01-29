@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 # Usage:
 #   export DEST=/path/to/dir && bash examples/LIBERO/data_preparation.sh
 # or
