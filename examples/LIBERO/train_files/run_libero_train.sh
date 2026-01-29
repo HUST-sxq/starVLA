@@ -4,7 +4,7 @@ set -euo pipefail
 ############################
 # 0) GPU / Distributed basic
 ############################
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 export NCCL_IB_DISABLE=1
 unset NCCL_SOCKET_IFNAME
 unset NCCL_IB_HCA
@@ -32,7 +32,7 @@ export WANDB_PROJECT="starVLA"
 # 2) Paths / Configs
 ############################
 Framework_name="QwenGR00T_WorldModel"
-base_vlm="/data/models/Qwen3-VL-4B-Instruct"
+base_vlm="/mnt/data/szeluresearch/models/Qwen3-VL-4B-Instruct"
 config_yaml="./examples/LIBERO/train_files/starvla_cotrain_libero.yaml"
 libero_data_root="/mnt/data/szeluresearch/datasets/libero"
 # if data_mix is libero_all, it includes libero_data_root.
@@ -88,7 +88,7 @@ fi
 ############################
 nohup accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 2 \
+  --num_processes 1 \
   --main_process_port 29600 \
   starVLA/training/train_starvla.py \
   --config_yaml "${config_yaml}" \
@@ -96,7 +96,7 @@ nohup accelerate launch \
   --framework.qwenvl.base_vlm "${base_vlm}" \
   --datasets.vla_data.data_root_dir "${libero_data_root}" \
   --datasets.vla_data.data_mix "${data_mix}" \
-  --datasets.vla_data.per_device_batch_size 16 \
+  --datasets.vla_data.per_device_batch_size 1 \
   --trainer.vla_data.video_backend torchvision_av \
   --trainer.max_train_steps 10000 \
   --trainer.save_interval 2000 \

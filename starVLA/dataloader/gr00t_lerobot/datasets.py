@@ -36,6 +36,11 @@ from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from PIL import Image
+import torch.distributed as dist
+
+from collections import defaultdict
+import bisect
+import json
 
 from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
 
@@ -164,6 +169,45 @@ class LeRobotSingleDataset(Dataset):
         )
 
         self._dataset_path = Path(dataset_path)
+
+        # ---------------- Optional subtask loader (meta/subtasks*.jsonl) (2026/1/26 by Xiaoquan Sun)----------------
+        # We keep it fully optional: if the file does not exist, do nothing.
+        self._subtask_path = None
+        self._subtasks_by_episode = None     # dict[int, list[tuple[int,int,str]]]
+        self._subtask_starts_by_episode = None  # dict[int, list[int]] for bisect
+
+        meta_dir = self._dataset_path / "meta"
+        if meta_dir.exists():
+            candidates = sorted(meta_dir.glob("subtasks.jsonl"))
+            if len(candidates) > 0:
+                self._subtask_path = candidates[0]  # pick the first match by default
+                self._subtasks_by_episode = defaultdict(list)
+
+                with open(self._subtask_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        ep = int(obj["episode_index"])
+                        fr0, fr1 = obj["frame_range"]  # inclusive range in your jsonl
+                        instr = obj["instruction"]
+                        self._subtasks_by_episode[ep].append((int(fr0), int(fr1), str(instr)))
+
+                # Sort segments and build start index for fast lookup
+                self._subtask_starts_by_episode = {}
+                for ep, segs in self._subtasks_by_episode.items():
+                    segs.sort(key=lambda x: x[0])
+                    self._subtask_starts_by_episode[ep] = [s for (s, _, _) in segs]
+
+                print(f"[subtask] Loaded: {self._subtask_path} (episodes={len(self._subtasks_by_episode)})")
+            else:
+                print(f"[subtask] No subtasks*.jsonl under {meta_dir}, skip.")
+        else:
+            print(f"[subtask] meta dir not found: {meta_dir}, skip.")
+        # ---------------------------------------------------------------------------------------------------
+
+
         self._dataset_name = self._dataset_path.name
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
@@ -352,28 +396,57 @@ class LeRobotSingleDataset(Dataset):
                 "fps": fps,
             }
 
+
         # 2. Dataset statistics
+        def is_main():
+            return (not dist.is_initialized()) or dist.get_rank() == 0
+        
         stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
-        try:
+        tmp_path = stats_path.with_suffix(".tmp")
+        
+        # ---------- all rank try to read  ----------
+        if stats_path.exists():
+            try:
+                with open(stats_path, "r") as f:
+                    le_statistics = json.load(f)
+                for stat in le_statistics.values():
+                    DatasetStatisticalValues.model_validate(stat)
+            except Exception as e:
+                print(
+                    f"[RANK {os.environ.get('RANK', 'NA')}] "
+                    f"Failed to load dataset statistics ({e}), rebuilding..."
+                )
+                le_statistics = None
+        else:
+            le_statistics = None
+        
+        # ---------- rank0 build ----------
+        if le_statistics is None and is_main():
+            print(f"[RANK 0] Calculating dataset statistics for {self.dataset_name}")
+        
+            parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+            parquet_files_filtered = [
+                pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
+            ]
+        
+            le_statistics = calculate_dataset_statistics(parquet_files_filtered)
+        
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(le_statistics, f, indent=4)
+            os.replace(tmp_path, stats_path)
+        
+            print(f"[RANK 0] Dataset statistics cached to {stats_path}")
+        
+        # ---------- sync ----------
+        if dist.is_initialized():
+            dist.barrier()
+        
+        # ---------- all rank read again ----------
+        if le_statistics is None:
             with open(stats_path, "r") as f:
                 le_statistics = json.load(f)
-            for stat in le_statistics.values():
-                DatasetStatisticalValues.model_validate(stat)
-        except (FileNotFoundError, ValidationError) as e:
-            print(f"Failed to load dataset statistics: {e}")
-            print(f"Calculating dataset statistics for {self.dataset_name}")
-            # Get all parquet files in the dataset paths
-            parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
-            parquet_files_filtered = []
-            #  parquet_files[0].name = "episode_033675.parquet" is broken file
-            for pf in parquet_files:
-                if "episode_033675.parquet" in pf.name:
-                    continue
-                parquet_files_filtered.append(pf)
-            
-            le_statistics = calculate_dataset_statistics(parquet_files_filtered)
-            with open(stats_path, "w") as f:
-                json.dump(le_statistics, f, indent=4)
+
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
@@ -446,32 +519,30 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
         """
-        # Create a hash key based on configuration to ensure cache validity
+        def is_main():
+            return (not dist.is_initialized()) or dist.get_rank() == 0
+    
         config_key = self._get_steps_config_key()
-        
-        # Create a unique filename based on config_key
-        # steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        # 
-        steps_filename =  "steps_data_index.pkl"
+        steps_filename = "steps_data_index.pkl"
         steps_path = self.dataset_path / "meta" / steps_filename
-        
-        # Try to load cached steps first
-        try:
-            if steps_path.exists():
+    
+        # ---------- try to read from cache  ----------
+        if steps_path.exists():
+            try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
                 return cached_data["steps"]
-        except (FileNotFoundError, pickle.PickleError, KeyError) as e:
-            print(f"Failed to load cached steps: {e}")
-            print("Computing steps from scratch...")
-
-        # Compute steps using single process
-        all_steps = self._get_all_steps_single_process()
-        
-        # Cache the computed steps with unique filename
-        try:
+            except Exception as e:
+                # include EOFError / PickleError / KeyError
+                print(
+                    f"[RANK {os.environ.get('RANK', 'NA')}] "
+                    f"Failed to load cached steps ({e}), will rebuild."
+                )
+    
+        # ---------- only build by rank0  ----------
+        if is_main():
+            all_steps = self._get_all_steps_single_process()
+    
             cache_data = {
                 "config_key": config_key,
                 "steps": all_steps,
@@ -480,17 +551,25 @@ class LeRobotSingleDataset(Dataset):
                 "computed_timestamp": pd.Timestamp.now().isoformat(),
                 "delete_pause_frame": self.delete_pause_frame,
             }
-            
-            # Ensure the meta directory exists
+    
             steps_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(steps_path, "wb") as f:
+            tmp_path = steps_path.with_suffix(".tmp")
+    
+            with open(tmp_path, "wb") as f:
                 pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Cached steps saved to {steps_path}")
-        except Exception as e:
-            print(f"Failed to cache steps: {e}")
-        
-        return all_steps
+            os.replace(tmp_path, steps_path)
+    
+            print(f"[RANK 0] Cached steps saved to {steps_path}")
+    
+        # ---------- sync after rank0  ----------
+        if dist.is_initialized():
+            dist.barrier()
+    
+        # ---------- read by all rank ----------
+        with open(steps_path, "rb") as f:
+            cached_data = pickle.load(f)
+    
+        return cached_data["steps"]
 
     def _get_steps_config_key(self) -> str:
         """Generate a configuration key for steps caching."""
@@ -739,6 +818,26 @@ class LeRobotSingleDataset(Dataset):
         """
         self.epoch = epoch
 
+    # ---------------- add_function _query_subtask (2026/1/26 by Xiaoquan Sun)----------------
+    def _query_subtask(self, episode_index: int, frame_id: int) -> str | None:
+        """Return subtask instruction if (episode_index, frame_id) is inside any segment."""
+        if self._subtasks_by_episode is None:
+            return None
+        segs = self._subtasks_by_episode.get(int(episode_index))
+        if not segs:
+            return None
+
+        starts = self._subtask_starts_by_episode[int(episode_index)]
+        j = bisect.bisect_right(starts, int(frame_id)) - 1
+        if j < 0:
+            return None
+
+        s, e, instr = segs[j]
+        if s <= frame_id <= e:
+            return instr
+        return None
+    # ---------------- add_function _query_subtask  (2026/1/26 by Xiaoquan Sun)----------------
+
     def __len__(self) -> int:
         """Get the total number of data points in the dataset.
 
@@ -777,12 +876,23 @@ class LeRobotSingleDataset(Dataset):
         
         # Get language and action data
         language = data[self.modality_keys["language"][0]][0]
+
+        # Optional subtask: query by (episode=trajectory_id, frame=base_index) (2026/1/26 by Xiaoquan Sun)
+        subtask = self._query_subtask(trajectory_id, base_index)
+
+        #print(f"Episode {trajectory_id}, Frame {base_index}, Subtask: {subtask}")
+
         action = []
         for action_key in self.modality_keys["action"]:
             action.append(data[action_key])
         action = np.concatenate(action, axis=1)
         
-        return dict(action=action, image=images, language=language)
+        out = dict(action=action, image=images, language=language)
+
+        if subtask is not None:
+            out = dict(action=action, image=images, language=language, subtask=subtask)
+        return out
+
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -1673,6 +1783,13 @@ class LeRobotMixtureDataset(Dataset):
                 
                 # Get language and action data
                 language = data[dataset.modality_keys["language"][0]][0]
+
+                #---Optional subtask: query by (episode=trajectory_id, frame=step)(2026/1/26 by Xiaoquan Sun)----
+                subtask = None
+                if hasattr(dataset, "_query_subtask"):
+                    subtask = dataset._query_subtask(trajectory_id, step)
+                #-------------------------------------------------------------------------------------------------
+
                 action = []
                 for action_key in dataset.modality_keys["action"]:
                     action.append(data[action_key])
@@ -1683,16 +1800,42 @@ class LeRobotMixtureDataset(Dataset):
                     state.append(data[state_key])
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 
-                state = None
-                
+                #state = None
+                # Build output dict first (always)
+                out = dict(action=action, image=all_images, lang=language)
+
+                # Optional: attach subtask if available
+                if subtask is not None:
+                    out["subtask"] = subtask
+
+                # Optional: attach state if enabled
                 if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
-                    
                     state = []
                     for state_key in dataset.modality_keys["state"]:
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
-                    # prim_images
-                    return dict(action=action, image=all_images, lang=language, state=state)
+                    out["state"] = state
+
+                return out
+
+                # if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
+                    
+                #     state = []
+                #     for state_key in dataset.modality_keys["state"]:
+                #         state.append(data[state_key])
+                #     state = np.concatenate(state, axis=1).astype(np.float16)
+                #     # prim_images
+                #     out = dict(action=action, image=all_images, lang=language, state=state)
+
+                #     return out
+           
+                # if subtask is not None:
+                #     out = dict(action=action, image=all_images, lang=language, subtask=subtask)
+                    
+                # return out
+
+
+
 
                 return dict(action=action, image=all_images, lang=language)
                 
