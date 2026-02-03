@@ -4,7 +4,7 @@ set -euo pipefail
 ############################
 # 0) GPU / Distributed basic
 ############################
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
 unset NCCL_SOCKET_IFNAME
 unset NCCL_IB_HCA
@@ -20,7 +20,10 @@ export NCCL_SOCKET_TIMEOUT_MS=360000
 
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29600
-
+# export AMP_ENABLED=True
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATH="/root/.local/bin:$PATH"
+echo 'export PATH="/root/.local/bin:$PATH"' >> ~/.bashrc
 ############################
 # 1) WANDB Settings
 ############################
@@ -40,7 +43,7 @@ libero_data_root="/mnt/data/szeluresearch/datasets/libero"
 data_mix="libero_10"
 
 run_root_dir="/mnt/data/szeluresearch/models/starVLA"
-run_id="$(date +%m%d_%H%M)_qwen3GR00T_WM_subtask"
+run_id="$(date +%m%d_%H%M)_qwen3GR00T_WM_task"
 
 output_dir="${run_root_dir}/${run_id}"
 mkdir -p "${output_dir}"
@@ -65,51 +68,80 @@ fi
 log_dir="./logs/training/$(date +'%Y%m%d')"
 mkdir -p "$log_dir"
 
-
 # Define the log file with timestamp
 log_file="${log_dir}/$(date +'%H%M').log"
 
 # Choose logging mode
-mode="logs"  # Options: "terminal", "logs", "both"
+mode="terminal"  # Options: "terminal", "logs", "both"
 
 if [ "$mode" == "terminal" ]; then
   # Only output to terminal
-  exec 2>&1
+  exec 2>&1  # Ensure output goes to terminal
+  nohup_cmd=""
 elif [ "$mode" == "logs" ]; then
   # Only output to log file
   exec > "$log_file" 2>&1
+  nohup_cmd="nohup"
 else
   # Output to both terminal and log file
   exec > >(tee -a "$log_file") 2>&1
+  nohup_cmd="nohup"
 fi
 
 ############################
 # 5) Launch
 ############################
-nohup accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 1 \
-  --main_process_port 29600 \
-  starVLA/training/train_starvla.py \
-  --config_yaml "${config_yaml}" \
-  --framework.name "${Framework_name}" \
-  --framework.qwenvl.base_vlm "${base_vlm}" \
-  --datasets.vla_data.data_root_dir "${libero_data_root}" \
-  --datasets.vla_data.data_mix "${data_mix}" \
-  --datasets.vla_data.per_device_batch_size 1 \
-  --trainer.vla_data.video_backend torchvision_av \
-  --trainer.max_train_steps 10000 \
-  --trainer.save_interval 2000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 1000 \
-  --run_root_dir "${run_root_dir}" \
-  --run_id "${run_id}" \
-  --wandb_project "${WANDB_PROJECT}" \
-  --wandb_entity "${WANDB_ENTITY}" \
-  "${extra_args[@]}" &
+if [ -z "$nohup_cmd" ]; then
+  # In terminal mode, run normally without nohup
+  accelerate launch \
+    --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+    --num_processes 2 \
+    --main_process_port 29600 \
+    starVLA/training/train_starvla.py \
+    --config_yaml "${config_yaml}" \
+    --framework.name "${Framework_name}" \
+    --framework.qwenvl.base_vlm "${base_vlm}" \
+    --datasets.vla_data.data_root_dir "${libero_data_root}" \
+    --datasets.vla_data.data_mix "${data_mix}" \
+    --datasets.vla_data.per_device_batch_size 16 \
+    --trainer.vla_data.video_backend torchvision_av \
+    --trainer.max_train_steps 10000 \
+    --trainer.save_interval 2500 \
+    --trainer.logging_frequency 100 \
+    --trainer.eval_interval 1000 \
+    --run_root_dir "${run_root_dir}" \
+    --run_id "${run_id}" \
+    --wandb_project "${WANDB_PROJECT}" \
+    --wandb_entity "${WANDB_ENTITY}" \
+    "${extra_args[@]}"
+else
+  # In other modes, use nohup to run in background
+  nohup accelerate launch \
+    --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+    --num_processes 2 \
+    --main_process_port 29600 \
+    starVLA/training/train_starvla.py \
+    --config_yaml "${config_yaml}" \
+    --framework.name "${Framework_name}" \
+    --framework.qwenvl.base_vlm "${base_vlm}" \
+    --datasets.vla_data.data_root_dir "${libero_data_root}" \
+    --datasets.vla_data.data_mix "${data_mix}" \
+    --datasets.vla_data.per_device_batch_size 16 \
+    --trainer.vla_data.video_backend torchvision_av \
+    --trainer.max_train_steps 10000 \
+    --trainer.save_interval 2500 \
+    --trainer.logging_frequency 100 \
+    --trainer.eval_interval 1000 \
+    --run_root_dir "${run_root_dir}" \
+    --run_id "${run_id}" \
+    --wandb_project "${WANDB_PROJECT}" \
+    --wandb_entity "${WANDB_ENTITY}" \
+    "${extra_args[@]}" > "$log_file" 2>&1 &
+fi
 
 # Display process ID of the background job
-echo "Training started in the background. Log file: $log_file"
+echo "Training started. Log file: $log_file"
+
 
 
 ##### Multi-Server Multi-GPU training script #####

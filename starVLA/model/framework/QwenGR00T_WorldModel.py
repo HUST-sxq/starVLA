@@ -36,8 +36,8 @@ IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
+#from starVLA.model.modules.action_model.GR00T_ActionHeader_GDPO import get_action_model, FlowmatchingActionHead
 #from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
-from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -74,7 +74,19 @@ class Qwen_GR00T_WorldModel(baseframework):
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
 
-        self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
+        #self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
+        
+        # ---- choose action head impl (base vs gdpo) ----
+        head_impl = str(getattr(self.config.framework.action_model, "head_impl", "base")).lower()
+
+        if head_impl == "gdpo":
+            from starVLA.model.modules.action_model.GR00T_ActionHeader_GDPO import get_action_model
+        elif head_impl in ["base", "default"]:
+            from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model
+        else:
+            raise ValueError(f"Unknown action head_impl={head_impl}. Use base/default/gdpo.")
+
+        self.action_model = get_action_model(config=self.config)
 
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
@@ -85,8 +97,9 @@ class Qwen_GR00T_WorldModel(baseframework):
         #   - "subtask": use only subtask instruction (fallback to task if missing)
         #   - "task_subtask": use Task + Subtask together
         #   - "none": ignore all language input (V2A mode)
-        #self.instruction_mode = str(getattr(self.config.datasets.vla_data, "instruction_mode", "task")).lower()
-        self.instruction_mode = str(getattr(self.config.datasets.vla_data, "instruction_mode", "task"))
+        # self.instruction_mode = str(getattr(self.config.datasets.vla_data, "instruction_mode", "task")).lower()
+        # self.instruction_mode = str(getattr(self.config.datasets.vla_data, "instruction_mode", "task"))
+        self.instruction_mode = str(getattr(self.config.datasets.vla_data, "instruction_mode", "task")).lower()
 
 
     def _build_instruction(self, task: str, subtask: Optional[str], mode: str) -> str:
@@ -229,27 +242,30 @@ class Qwen_GR00T_WorldModel(baseframework):
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
+            # 1) cast vl to fp32 (important)
+            last_hidden_fp32 = last_hidden.float()
+
             actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                np.array(actions), device=last_hidden.device, dtype=torch.float32
             )  # [B, T_full, action_dim]
-            actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
+
+            actions_target = actions[:, -(self.future_action_window_size + 1):, :]  # [B, H, A]
 
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
-            actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
-            
+
+            actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)  # fp32
+            last_hidden_repeated = last_hidden_fp32.repeat(repeated_diffusion_steps, 1, 1)   # fp32
+
             state_repeated = None
             if state is not None:
                 state = torch.tensor(
-                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+                    np.array(state), device=last_hidden.device, dtype=torch.float32
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
-
-
+            action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)
 
         return {"action_loss": action_loss}
 
@@ -319,6 +335,132 @@ class Qwen_GR00T_WorldModel(baseframework):
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+    
+    @torch.no_grad()
+    def sample_action_group_for_gdpo(
+        self,
+        examples,
+        num_samples: int = 4,          # K
+        num_steps: int = None,         # diffusion/flow steps for sampling
+        mu_steps: int = None,          # steps for mu (can be same as num_steps)
+        z_mode: str = "zeros",         # "zeros" or "fixed_rand"
+        fixed_seed: int = 0,
+    ):
+        """
+        For GDPO/GRPO post-training:
+        - Encode (image, instruction) -> vl_embs
+        - Sample K candidate action chunks -> actions_group [B,K,H,A]
+        - Get deterministic reference action -> mu [B,H,A] (optional but recommended)
+
+        Returns dict with:
+            vl_embs: [B, L, C] float32
+            actions_group: [B, K, H, A] float32
+            mu: [B, H, A] float32
+            state: [B, 1, state_dim] float32 or None
+            final_instructions: List[str]  (for debugging / logging)
+        """
+
+        # ---- normalize examples to list ----
+        if isinstance(examples, dict):
+            batch_images = examples["image"]
+            state = examples.get("state", None)
+            task_instructions = examples.get("lang", None)
+            if task_instructions is None:
+                task_instructions = examples.get("language", [""] * len(batch_images))
+            subtasks = examples.get("subtask", None)
+        else:
+            batch_images = [ex["image"] for ex in examples]
+            state = [ex["state"] for ex in examples] if ("state" in examples[0]) else None
+            task_instructions = [ex.get("lang", ex.get("language", "")) for ex in examples]
+            subtasks = [ex.get("subtask", None) for ex in examples]
+
+        if subtasks is None:
+            subtasks = [None] * len(task_instructions)
+
+        # ---- build final instructions according to instruction_mode ----
+        mode = getattr(self, "instruction_mode", "task_subtask")
+
+        if mode == "null":
+            final_instructions = [""] * len(batch_images)
+        elif mode == "task":
+            final_instructions = [task_instructions[i] for i in range(len(task_instructions))]
+        elif mode == "subtask":
+            final_instructions = [
+                self._build_instruction(task_instructions[i], subtasks[i], "subtask")
+                for i in range(len(task_instructions))
+            ]
+        elif mode == "task_subtask":
+            final_instructions = [
+                self._build_instruction(task_instructions[i], subtasks[i], "task_subtask")
+                for i in range(len(task_instructions))
+            ]
+        else:
+            raise ValueError(f"Unsupported instruction_mode={mode}")
+
+        # ---- optional resize (keep consistent with predict_action) ----
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            # if your batch_images are PILs already, resize_images works;
+            # if not, make sure your dataloader provides compatible format
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        # ---- VLM forward -> vl_embs ----
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=final_instructions
+        )
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            vl_embs = qwenvl_outputs.hidden_states[-1]   # [B, L, C] bf16
+
+        # ---- cast to fp32 for action head stability ----
+        vl_embs = vl_embs.float()
+
+        state_tensor = None
+        if state is not None:
+            state_tensor = torch.tensor(np.array(state), device=vl_embs.device, dtype=torch.float32)
+
+        # ---- require GDPO-capable head ----
+        if not hasattr(self.action_model, "sample_actions"):
+            raise RuntimeError(
+                "Current action_model does NOT support sample_actions(). "
+                "Please set config.framework.action_model.head_impl: gdpo"
+            )
+
+        # ---- sample group actions ----
+        actions_group = self.action_model.sample_actions(
+            vl_embs=vl_embs,
+            state=state_tensor,
+            num_samples=int(num_samples),
+            num_steps=num_steps,
+        )  # [B, K, H, A]
+
+        # ---- compute deterministic mu (recommended for GDPO) ----
+        if hasattr(self.action_model, "predict_mu"):
+            mu = self.action_model.predict_mu(
+                vl_embs=vl_embs,
+                state=state_tensor,
+                num_steps=mu_steps if mu_steps is not None else num_steps,
+                z_mode=z_mode,
+                fixed_seed=int(fixed_seed),
+            )  # [B, H, A]
+        else:
+            mu = None
+
+        return {
+            "vl_embs": vl_embs,
+            "actions_group": actions_group,
+            "mu": mu,
+            "state": state_tensor,
+            "final_instructions": final_instructions,
+        }
+
 
 
 

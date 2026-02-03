@@ -54,6 +54,7 @@ class Args:
 
     job_name: str = "test"
 
+    instruction_mode: str = "task" # Options: "task", "null"
 
 def eval_libero(args: Args) -> None:
     logging.info(f"Arguments: {json.dumps(dataclasses.asdict(args), indent=4)}")
@@ -109,8 +110,14 @@ def eval_libero(args: Args) -> None:
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
+            # 如果instruction_mode是"null"，则不提供任务指令
+            if args.instruction_mode == "null":
+                current_instruction = "" 
+            else:
+                current_instruction = str(task_description)
+
             # Reset environment
-            client_model.reset(task_description=task_description)  # Reset the client connection
+            client_model.reset(task_description=current_instruction)  # Reset the client connection
             env.reset()
 
             # Set initial states
@@ -160,7 +167,7 @@ def eval_libero(args: Args) -> None:
                         wrist_img, axis=0
                     ),  # (H, W, C)
                     "observation.state": np.expand_dims(state, axis=0),
-                    "instruction": [str(task_description)],
+                    "instruction": [current_instruction],
                 }
 
                 # align key with model API --> 这里给了两个图像 --> check training
@@ -294,6 +301,8 @@ def start_debugpy_once():
     start_debugpy_once._started = True
 
 if __name__ == "__main__":
-    if os.getenv("DEBUG", False):
+    debug_env = os.getenv("DEBUG", "False")  # 默认 "False"
+    DEBUG = debug_env.lower() in ["1", "true", "yes"]
+    if DEBUG:
         start_debugpy_once()
     tyro.cli(eval_libero)

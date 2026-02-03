@@ -1,0 +1,5 @@
+assets: /root/starVLA/third_party/LIBERO-PRO/libero/libero/./assets
+bddl_files: /root/starVLA/third_party/LIBERO-PRO/libero/libero/./bddl_files
+benchmark_root: /root/starVLA/third_party/LIBERO-PRO/libero/libero
+datasets: /root/starVLA/datasets
+init_states: /root/starVLA/third_party/LIBERO-PRO/libero/libero/./init_files

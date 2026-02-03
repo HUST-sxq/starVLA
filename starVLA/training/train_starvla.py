@@ -353,13 +353,35 @@ class VLATrainer(TrainerUtils):
                 progress_bar.update(1)
                 self.completed_steps += 1
             
+
+            # if self.accelerator.is_local_main_process:
+            #     progress_bar.set_postfix(
+            #             {
+            #                 "data_times": f"{t_end_data - t_start_data:.3f}",
+            #                 "model_times": f"{t_end_model - t_start_model:.3f}",
+            #             }
+            #         )
+
+            #---------------------------- log step metrics ----------------------------#
             if self.accelerator.is_local_main_process:
-                progress_bar.set_postfix(
-                        {
-                            "data_times": f"{t_end_data - t_start_data:.3f}",
-                            "model_times": f"{t_end_model - t_start_model:.3f}",
-                        }
-                    )
+                loss_val = None
+
+                if isinstance(step_metrics, dict) and "action_dit_loss" in step_metrics:
+                    loss_val = step_metrics["action_dit_loss"]
+
+                if loss_val is not None and hasattr(loss_val, "item"):
+                    loss_val = loss_val.item()
+
+                postfix = {
+                    "data_times": f"{t_end_data - t_start_data:.3f}",
+                    "model_times": f"{t_end_model - t_start_model:.3f}",
+                }
+                if loss_val is not None:
+                    postfix["loss"] = f"{float(loss_val):.6f}"
+
+                progress_bar.set_postfix(postfix)
+            #---------------------------------------------------------------------------#
+
 
             # evaluate model
             if self.completed_steps % self.config.trainer.eval_interval == 0:
@@ -395,6 +417,16 @@ class VLATrainer(TrainerUtils):
         examples = self._get_next_batch()
         score = 0.0
         num_samples = len(examples)
+
+        # ---------------[debug] print example info-------------------#
+        if len(examples) > 0:
+            print("DEBUG examples type:", type(examples))
+            print("DEBUG example[0] type:", type(examples[0]))
+            print("DEBUG example[0] preview:", str(examples[0])[:200])
+        #-------------------------------------------------------------#
+
+
+
         actions = [example["action"] for example in examples]  # label
         # Predict actions using the model
         output_dict = self.model.predict_action(
@@ -486,9 +518,20 @@ def main(cfg) -> None:
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
+    # ---------------- choose trainer strategy ----------------
+    strategy = str(getattr(cfg.trainer, "train_strategy", "bc")).lower()
+
+    if strategy == "gdpo":
+        from starVLA.training.trainer_gdpo import GDPOTrailer
+        TrainerCls = GDPOTrailer
+        logger.info("✅ Using GDPO trainer")
+    else:
+        TrainerCls = VLATrainer
+        logger.info("✅ Using BC trainer (VLATrainer)")
+        
     # create trainer
     # Run VLA Training
-    trainer = VLATrainer(
+    trainer = TrainerCls(
         cfg=cfg,
         model=vla,
         vla_train_dataloader=vla_train_dataloader,
